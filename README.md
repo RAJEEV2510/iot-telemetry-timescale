@@ -17,38 +17,37 @@ docker compose up --build
 
 ```mermaid
 flowchart LR
-    subgraph Devices
-        SIM[Simulator<br/>200 devices × 5 msg/s]
-    end
-
-    SIM -- "devices/{id}/telemetry<br/>MQTT QoS 0" --> BROKER[(Mosquitto<br/>MQTT broker)]
+    SIM["Simulator<br/>200 devices × 5 msg/s"]
+    SIM -- "devices/id/telemetry (QoS 0)" --> BROKER[("Mosquitto<br/>MQTT broker")]
 
     subgraph Ingestion["Ingestion service (scale out: N replicas)"]
-        SUB[MQTT listener<br/>$share/ingestion/...] --> VAL[Parse + validate]
-        VAL --> CH[[Bounded Channel&lt;T&gt;<br/>100k capacity]]
-        CH --> W1[COPY writer 1]
-        CH --> W2[COPY writer 2]
+        SUB["MQTT listener<br/>shared subscription"] --> VAL["Parse + validate"]
+        VAL --> CH[["Bounded channel<br/>100k capacity"]]
+        CH --> W1["COPY writer 1"]
+        CH --> W2["COPY writer 2"]
     end
 
-    BROKER -- shared subscription<br/>load-balanced --> SUB
-    W1 -- binary COPY<br/>≤5k rows/batch --> TSDB
-    W2 -- binary COPY --> TSDB
+    BROKER -- "load-balanced across replicas" --> SUB
 
     subgraph TSDB["TimescaleDB"]
-        HT[(telemetry<br/>hypertable, 1-day chunks)]
-        CAGG[(telemetry_1m<br/>continuous aggregate)]
-        HT -. refreshed every minute .-> CAGG
+        HT[("telemetry<br/>hypertable, 1-day chunks")]
+        CAGG[("telemetry_1m<br/>continuous aggregate")]
+        HT -. "refreshed every minute" .-> CAGG
     end
+
+    W1 -- "binary COPY, up to 5k rows" --> HT
+    W2 -- "binary COPY" --> HT
 
     subgraph API["ASP.NET Core API"]
-        REST[REST endpoints<br/>Dapper]
-        LIVE[Live feed<br/>SignalR, 1 snapshot/s]
+        REST["REST endpoints<br/>Dapper"]
+        LIVE["Live feed<br/>SignalR, 1 snapshot/s"]
     end
 
-    BROKER -- devices/+/telemetry --> LIVE
-    REST --> HT
-    REST --> CAGG
-    API --> UI[Browser dashboard]
+    BROKER -- "all device topics" --> LIVE
+    HT --> REST
+    CAGG --> REST
+    REST --> UI["Browser dashboard"]
+    LIVE --> UI
 ```
 
 ### Ingestion path
