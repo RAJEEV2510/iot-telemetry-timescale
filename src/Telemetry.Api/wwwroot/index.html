@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IoT Telemetry Dashboard</title>
+  <style>
+    :root { --bg:#0f1419; --panel:#1a2029; --line:#2a323d; --text:#e6e9ee; --muted:#8b95a3; --accent:#4ea1ff; --warn:#ffb454; --bad:#ff6b6b; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+    h1 { font-size:18px; margin:0; }
+    #status { font-size:12px; color:var(--muted); }
+    main { padding:24px; display:grid; gap:16px; max-width:1200px; margin:0 auto; }
+    .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:12px; }
+    .card, .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+    .card .label { color:var(--muted); font-size:12px; }
+    .card .value { font-size:24px; font-weight:600; font-variant-numeric:tabular-nums; }
+    .grid { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.4fr); gap:16px; }
+    @media (max-width: 860px) { .grid { grid-template-columns:1fr; } }
+    .panel h2 { font-size:14px; margin:0 0 10px; }
+    .scroll { max-height:460px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+    th, td { text-align:right; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; }
+    th { color:var(--muted); font-weight:500; position:sticky; top:0; background:var(--panel); }
+    tbody tr { cursor:pointer; }
+    tbody tr:hover, tbody tr.selected { background:#243041; }
+    .low { color:var(--bad); } .hot { color:var(--warn); }
+    .muted { color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📡 IoT Telemetry · TimescaleDB</h1>
+    <span id="status">Connecting…</span>
+  </header>
+  <main>
+    <section class="cards">
+      <div class="card"><div class="label">Live devices</div><div class="value" id="devices">–</div></div>
+      <div class="card"><div class="label">Messages / sec (live)</div><div class="value" id="rate">–</div></div>
+      <div class="card"><div class="label">Stored last minute</div><div class="value" id="lastMinute">–</div></div>
+      <div class="card"><div class="label">Total rows (approx.)</div><div class="value" id="rows">–</div></div>
+      <div class="card"><div class="label">Storage · chunks</div><div class="value" id="storage">–</div></div>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2>Devices <span class="muted">(click one)</span></h2>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Device</th><th>Temp °C</th><th>Humidity %</th><th>Battery %</th></tr></thead>
+            <tbody id="rows-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 id="chart-title">Select a device</h2>
+        <canvas id="chart" height="260"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <script>
+    const fmt = new Intl.NumberFormat();
+    const $ = id => document.getElementById(id);
+    let selected = null;
+
+    const chart = new Chart($("chart"), {
+      type: "line",
+      data: { labels: [], datasets: [
+        { label: "Avg temperature °C", data: [], borderColor: "#4ea1ff", tension: 0.3, pointRadius: 0 },
+        { label: "Max temperature °C", data: [], borderColor: "#ffb454", tension: 0.3, pointRadius: 0 },
+        { label: "Avg humidity %", data: [], borderColor: "#7bd88f", tension: 0.3, pointRadius: 0, yAxisID: "y1" },
+      ]},
+      options: {
+        animation: false,
+        scales: {
+          x: { ticks: { color: "#8b95a3", maxTicksLimit: 8 }, grid: { color: "#2a323d" } },
+          y: { ticks: { color: "#8b95a3" }, grid: { color: "#2a323d" } },
+          y1: { position: "right", ticks: { color: "#8b95a3" }, grid: { display: false } },
+        },
+        plugins: { legend: { labels: { color: "#e6e9ee" } } },
+      },
+    });
+
+    function renderDevices(devices) {
+      $("rows-body").innerHTML = devices.map(d => `
+        <tr data-id="${d.deviceId}" class="${d.deviceId === selected ? "selected" : ""}">
+          <td>${d.deviceId}</td>
+          <td class="${d.temperature > 35 ? "hot" : ""}">${d.temperature.toFixed(1)}</td>
+          <td>${d.humidity.toFixed(1)}</td>
+          <td class="${d.battery < 20 ? "low" : ""}">${d.battery.toFixed(0)}</td>
+        </tr>`).join("");
+    }
+
+    $("rows-body").addEventListener("click", e => {
+      const row = e.target.closest("tr");
+      if (!row) return;
+      selected = row.dataset.id;
+      loadAggregates();
+    });
+
+    async function loadAggregates() {
+      if (!selected) return;
+      $("chart-title").textContent = `${selected} · 1-minute rollups (continuous aggregate)`;
+      const res = await fetch(`/api/devices/${encodeURIComponent(selected)}/aggregates?hours=1`);
+      const rows = await res.json();
+      chart.data.labels = rows.map(r => new Date(r.bucket).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+      chart.data.datasets[0].data = rows.map(r => r.avgTemperature);
+      chart.data.datasets[1].data = rows.map(r => r.maxTemperature);
+      chart.data.datasets[2].data = rows.map(r => r.avgHumidity);
+      chart.update();
+    }
+
+    async function loadStats() {
+      try {
+        const s = await (await fetch("/api/stats")).json();
+        $("lastMinute").textContent = fmt.format(s.readingsLastMinute);
+        $("rows").textContent = fmt.format(Math.max(s.approximateRows, 0));
+        $("storage").textContent = `${(s.hypertableBytes / 1048576).toFixed(1)} MB · ${s.chunks}`;
+      } catch { /* API not ready yet */ }
+    }
+
+    const connection = new signalR.HubConnectionBuilder().withUrl("/hubs/telemetry").withAutomaticReconnect().build();
+    connection.on("snapshot", s => {
+      $("devices").textContent = fmt.format(s.deviceCount);
+      $("rate").textContent = fmt.format(s.messagesPerSecond);
+      renderDevices(s.devices);
+    });
+    connection.onreconnecting(() => $("status").textContent = "Reconnecting…");
+    connection.onreconnected(() => $("status").textContent = "Live");
+    connection.start().then(() => $("status").textContent = "Live").catch(() => $("status").textContent = "Disconnected");
+
+    loadStats();
+    setInterval(loadStats, 5000);
+    setInterval(loadAggregates, 15000);
+  </script>
+</body>
+</html>

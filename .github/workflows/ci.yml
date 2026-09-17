@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release
+      - run: dotnet test --no-build -c Release --logger "console;verbosity=normal"
+
+  end-to-end:
+    # Boots the full stack (TimescaleDB, Mosquitto, simulator, ingestion, API) and verifies
+    # that simulated telemetry flows all the way into the hypertable and out through the API.
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start stack
+        run: docker compose up -d --build
+      - name: Wait for telemetry to reach TimescaleDB
+        run: |
+          for i in $(seq 1 60); do
+            stats=$(curl -fs http://localhost:8080/api/stats || true)
+            echo "attempt $i: $stats"
+            count=$(echo "$stats" | jq -r '.readingsLastMinute // 0' 2>/dev/null || echo 0)
+            if [ "${count:-0}" -gt 1000 ]; then
+              echo "Pipeline OK: $count readings stored in the last minute"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Telemetry never reached the database"
+          exit 1
+      - name: Check query endpoints
+        run: |
+          set -e
+          curl -fs http://localhost:8080/health
+          devices=$(curl -fs http://localhost:8080/api/devices | jq length)
+          echo "devices with recent data: $devices"
+          test "$devices" -gt 0
+          curl -fs "http://localhost:8080/api/devices/sensor-0001/aggregates?hours=1" | jq 'length'
+          curl -fs "http://localhost:8080/api/devices/sensor-0001/readings?minutes=5" | jq 'length'
+          curl -fs http://localhost:8080/ | grep -q "IoT Telemetry"
+      - name: Service logs
+        if: always()
+        run: docker compose logs --no-color --tail 80
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
